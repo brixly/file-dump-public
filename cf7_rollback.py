@@ -94,7 +94,7 @@ def run(cmd, user=None, home=None, input=None, timeout=120):
     if user:
         cmd = ['runuser', '-u', user, '--'] + cmd
     env = {'PATH': '/usr/local/cpanel/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': home, 'LANG': 'C'}
-    return subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout, cwd='/', env=env)
+    return subprocess.run(cmd, input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout, cwd='/', env=env)
 
 
 def read_header(path, n=4000):
@@ -345,7 +345,7 @@ def probe(php, path, soft_item):
             resolves += ['--resolve', f"{h}:{port}:{ip}"]
     r = subprocess.run(['curl', '-sk', '-L', '--max-redirs', '3', '-m', '20'] + resolves +
                        ['-o', '-', '-w', '\n%{http_code}', f"{scheme}://{host}{rest.rstrip('/')}/"],
-                       capture_output=True, timeout=30)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
     body = r.stdout.decode(errors='ignore')
     code = body.rsplit('\n', 1)[-1]
     return f"{code}{' composer-error' if 'Composer detected issues' in body else ''}"

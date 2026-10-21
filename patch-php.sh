@@ -4,20 +4,24 @@
 #   1. Scan for signs of compromise (read-only, nothing changed)
 #   2. Wizard: detect platform -> apply mitigation -> patch PHP -> restart -> verify
 #
-# Usage:  php2shell-response.sh              interactive (asks y/n at each step)
-#         php2shell-response.sh --yes        answer yes to everything (Ansible / unattended)
-#         php2shell-response.sh --check      scan + report only, change nothing
-#         php2shell-response.sh --since DATE look for changes since DATE (default 2026-10-20)
+# Usage:  php2shell-response.sh              interactive: status -> mitigate -> patch -> verify -> optional scan
+#         php2shell-response.sh --yes        answer yes to everything except the scan (Ansible / unattended)
+#         php2shell-response.sh --yes --scan unattended, scan included
+#         php2shell-response.sh --check      status report only, change nothing (add --scan to include the scan)
+#         php2shell-response.sh --since DATE scan for changes since DATE (default 2026-10-20)
+#
+# Safe to re-run: every step is idempotent. Re-run when a vendor (e.g. CloudLinux) publishes new packages.
 #
 # Platforms: cPanel (with or without CloudLinux), DirectAdmin, Debian/Ubuntu, plain RHEL-family.
 # Exit code: 0 when every PHP binary found is patched, 1 otherwise.
 
 SINCE="2026-10-20"
-AUTO_YES=0; CHECK_ONLY=0
+AUTO_YES=0; CHECK_ONLY=0; DO_SCAN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes|-y)   AUTO_YES=1 ;;
     --check)    CHECK_ONLY=1 ;;
+    --scan)     DO_SCAN=1 ;;
     --since)    SINCE="$2"; shift ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac; shift
@@ -189,6 +193,29 @@ restart_php() {
   ok "done"
 }
 
+# ---------- 3b. cPGuard WAF check ----------
+cpguard_check() {
+  local root="" d f newest hits
+  for d in /usr/local/cpguard /opt/cpguard /etc/cpguard; do [ -d "$d" ] && { root="$d"; break; }; done
+  have cpguard && root="${root:-$(dirname "$(readlink -f "$(command -v cpguard)")")}"
+  [ -n "$root" ] || return 0            # cPGuard not installed - nothing to check
+  hdr "cPGuard WAF"
+  # rule files cPGuard may have dropped, in its own tree or the server's ModSecurity include dirs
+  hits=$(grep -rslE 'PHP_SESSION_UPLOAD_PROGRESS|upload_progress|php2shell|CVE-2026-10961' \
+          "$root" /etc/apache2/conf.d /etc/httpd/conf.d /usr/local/apache/conf /etc/modsecurity /usr/local/lsws/conf \
+          /etc/nginx/modsec /usr/local/directadmin/custombuild/custom/modsecurity 2>/dev/null | grep -iE '\.conf$|rules|\.rule' | head -5)
+  if [ -n "$hits" ]; then
+    ok "php2shell WAF rule present:"; echo "$hits" | sed 's/^/    /'
+    newest=$(stat -c '%y %n' $hits 2>/dev/null | sort | tail -1 | cut -c1-16)
+    echo "    newest rule file: $newest"
+  else
+    warn "cPGuard is installed ($root) but no php2shell rule was found in the usual rule locations."
+    warn "Force a rule refresh: cPGuard UI -> WAF module -> disable, then enable. Then re-run with --check."
+  fi
+  f=$(ls -t "$root"/*.log "$root"/logs/*.log /var/log/cpguard*.log 2>/dev/null | head -1)
+  [ -n "$f" ] && echo "    last cPGuard log activity: $(stat -c %y "$f" | cut -c1-16)  ($f)"
+}
+
 # ---------- 4. verify ----------
 verify() {
   hdr "PHP status on $(hostname)"
@@ -223,11 +250,10 @@ verify() {
 hdr "php2shell response - $(hostname)"
 echo "Platform: $PLATFORM | CloudLinux: $CL | LiteSpeed: $LSWS | Package manager: $PKG"
 echo "PHP binaries: $(php_binaries | wc -l)"
-if [ $CHECK_ONLY = 1 ]; then scan; verify; exit $?; fi
+if [ $CHECK_ONLY = 1 ]; then verify; RC=$?; cpguard_check; [ $DO_SCAN = 1 ] && scan; exit $RC; fi
 
-ask "Run the compromise scan (read-only)?" && scan
-echo
 verify; RC=$?
+cpguard_check
 echo
 if [ $RC != 0 ]; then
   ask "Apply the interim mitigation (upload_progress off + service reload)?" && mitigate
@@ -235,5 +261,9 @@ if [ $RC != 0 ]; then
   ask "Attempt to patch PHP now via $PKG and restart PHP services?" && { patch; echo; verify; RC=$?; }
 else
   ask "Everything is patched. Apply the mitigation anyway as belt-and-braces?" && mitigate
+fi
+echo
+if [ $DO_SCAN = 1 ]; then scan
+elif [ $AUTO_YES = 0 ]; then ask "Run the compromise scan now (read-only, can take a few minutes)?" && scan
 fi
 exit $RC

@@ -259,6 +259,12 @@ verify() {
   printf '%-30s %-9s %-10s %s\n' "PATCH STATUS" "MITIG." "VERSION" "BINARY"
   while read -r bin; do
     [ -n "$bin" ] || continue; found=1
+    # CloudLinux's /usr/bin/php is a selector wrapper that dispatches to an alt-php build already listed above
+    if [ "$bin" = /usr/bin/php ] && [ $CL = 1 ]; then
+      pkg=$(rpm -qf --qf '%{NAME}' "$bin" 2>/dev/null)
+      if [[ "$pkg" != php && "$pkg" != php-cli ]]; then
+        printf '%-30s %-9s %-10s %s\n' "SKIPPED (CL selector wrapper)" "-" "-" "$bin"; continue; fi
+    fi
     ver=$("$bin" -n -r 'echo PHP_VERSION;' 2>/dev/null | head -1)
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || ver=$("$bin" -n -v 2>/dev/null | sed -nE 's/^PHP ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)   # php-fpm has no -r
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || ver=""
@@ -287,7 +293,8 @@ verify() {
     elif ! ver_ge "$br" 7.4;                                        then st="NOT PATCHED (EOL upstream)"; bad=1
     elif [ -z "$log" ] && [ -z "${FIXED[$br]}" ];                   then st="CHECK MANUALLY"; bad=1
     else st="NOT PATCHED"; bad=1; fi
-    mit=$("$bin" -r 'echo ini_get("session.upload_progress.enabled") ? "on" : "off";' 2>/dev/null)
+    mit=$("$bin" -r 'echo ini_get("session.upload_progress.enabled") ? "on" : "off";' 2>/dev/null | head -1)
+    [[ "$mit" == on || "$mit" == off ]] || mit="?"
     [[ "$bin" == */php-fpm ]] && mit="n/a"
     printf '%-30s %-9s %-10s %s\n' "$st" "${mit:-?}" "$ver" "$bin"
   done < <(php_binaries)

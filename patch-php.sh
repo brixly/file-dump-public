@@ -14,7 +14,7 @@
 #
 # Platforms: cPanel (with or without CloudLinux), DirectAdmin, Debian/Ubuntu, plain RHEL-family.
 # Exit code: 0 when every PHP binary found is patched, 1 otherwise.
-
+ 
 SINCE="2026-10-20"
 AUTO_YES=0; CHECK_ONLY=0; DO_SCAN=0
 while [ $# -gt 0 ]; do
@@ -26,13 +26,13 @@ while [ $# -gt 0 ]; do
     *) echo "Unknown option: $1"; exit 2 ;;
   esac; shift
 done
-
+ 
 CVE_RE='CVE-2026-10961[89]'
 declare -A FIXED=([8.2]=8.2.35 [8.3]=8.3.36 [8.4]=8.4.27 [8.5]=8.5.12)
 MITIG_FILE='99-php2shell-mitigation.ini'
 MITIG_BODY='; php2shell (CVE-2026-109618/109619) interim mitigation - safe to leave in place after patching
 session.upload_progress.enabled = Off'
-
+ 
 # ---------- helpers ----------
 c_red=$'\e[31m'; c_grn=$'\e[32m'; c_yel=$'\e[33m'; c_bld=$'\e[1m'; c_off=$'\e[0m'
 [ -t 1 ] || c_red= c_grn= c_yel= c_bld= c_off=
@@ -46,7 +46,7 @@ ask()  { # ask "question" -> 0 yes / 1 no
     case "$a" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; esac; done; }
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 have()   { command -v "$1" >/dev/null 2>&1; }
-
+ 
 # ---------- platform detection ----------
 PLATFORM=other; CL=0; LSWS=0; PKG=none
 [ -f /etc/cloudlinux-release ] && CL=1
@@ -58,58 +58,58 @@ elif have yum || have dnf;                      then PLATFORM=rhel
 fi
 if have dnf; then PKG=dnf; elif have yum; then PKG=yum; elif have apt-get; then PKG=apt; fi
 WEBROOTS=(/home/*/public_html /home/*/domains/*/public_html /var/www /usr/share/nginx/html /srv/www)
-
+ 
 php_binaries() {
   local b; for b in /opt/cpanel/ea-php*/root/usr/bin/php /opt/alt/php*/usr/bin/php \
                     /usr/local/php*/bin/php /usr/bin/php[0-9]*.[0-9]* /opt/remi/php*/root/usr/bin/php /usr/bin/php \
                     /opt/cpguard/cpg-php-fpm/bin/php /opt/cpguard/cpg-php-fpm/sbin/php-fpm /usr/local/lsws/lsphp*/bin/php; do
     [ -x "$b" ] && echo "$(readlink -f "$b")"; done | sort -u; }
-
+ 
 # ---------- 1. compromise scan ----------
 scan() {
   local findings=0 t
   hdr "Compromise scan on $(hostname) (changes since $SINCE)"
-
+ 
   echo "-- PHP workers spawning other processes"
   t=$(ps -eo pid,ppid,user,comm,args --no-headers | awk '
     { pid[$1]=1; comm[$1]=$4; ppid[$1]=$2; line[$1]=$0 }
     END { for (p in pid) { q=ppid[p]; if (q in comm && comm[q] ~ /^(php-fpm|php-cgi|lsphp|httpd|apache2|php[0-9.]*)$/ \
             && comm[p] !~ /^(php-fpm|php-cgi|lsphp|httpd|apache2|php[0-9.]*|suexec|cgi-sys|logrotate)$/) print line[p] } }')
   if [ -n "$t" ]; then bad "Unexpected children of PHP/web processes:"; echo "$t" | head -30; findings=1; else ok "none"; fi
-
+ 
   echo "-- Reverse-shell / dropper patterns in running processes"
   t=$(ps -eo pid,user,args --no-headers | grep -E '/dev/tcp/|mkfifo|fsockopen|nc (-e|-c)|socat .*exec|base64 (-d|--decode)|python[0-9.]* -c .*socket|perl -e .*socket' | grep -v grep)
   if [ -n "$t" ]; then bad "Suspicious command lines:"; echo "$t" | head -20; findings=1; else ok "none"; fi
-
+ 
   echo "-- Outbound connections from PHP workers"
   t=$(ss -tnp 2>/dev/null | grep -E 'users:\(\("(php|lsphp)' | grep -vE ':(3306|6379|11211|25|465|587|443|80|53) ' | head -20)
   if [ -n "$t" ]; then warn "Review these (DB/mail/HTTP ports are filtered out):"; echo "$t"; else ok "none unusual"; fi
-
+ 
   echo "-- PHP files created/modified in web roots since $SINCE (first 40)"
   t=$(timeout 180 find "${WEBROOTS[@]}" -xdev -type f \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' -o -name '.htaccess' \) \
         -newermt "$SINCE" -printf '%TY-%Tm-%Td %TH:%TM %u %p\n' 2>/dev/null | sort | head -40)
   if [ -n "$t" ]; then warn "Recently changed - normal for updates/deploys, abnormal for odd names or wp-content/uploads:"; echo "$t"; else ok "none"; fi
-
+ 
   echo "-- Likely webshells in web roots (first 20)"
   t=$(timeout 180 grep -rlE --include='*.php' --include='*.phtml' \
         '(eval|assert|system|passthru|shell_exec|popen|proc_open)\s*\(\s*(base64_decode|gzinflate|str_rot13|gzuncompress|\$_(GET|POST|REQUEST|COOKIE))' \
         "${WEBROOTS[@]}" 2>/dev/null | head -20)
   if [ -n "$t" ]; then bad "Review these files:"; echo "$t"; findings=1; else ok "none matched"; fi
-
+ 
   echo "-- Executables / PHP in temp dirs since $SINCE"
   t=$(find /tmp /var/tmp /dev/shm -xdev -type f -newermt "$SINCE" \( -perm -u+x -o -name '*.php' -o -name '*.sh' -o -name '*.pl' -o -name '*.py' \) -printf '%TY-%Tm-%Td %TH:%TM %u %p\n' 2>/dev/null | head -20)
   if [ -n "$t" ]; then bad "Found:"; echo "$t"; findings=1; else ok "none"; fi
-
+ 
   echo "-- Crontabs changed since $SINCE / suspicious cron lines"
   t=$(find /var/spool/cron /etc/cron.d /etc/crontab -newermt "$SINCE" 2>/dev/null)
   [ -n "$t" ] && { warn "Modified recently:"; echo "$t"; }
   t=$(grep -rE 'curl|wget|base64|/dev/tcp|/tmp/|/dev/shm' /var/spool/cron /etc/cron.d /etc/crontab 2>/dev/null | head -20)
   if [ -n "$t" ]; then warn "Cron lines worth a look:"; echo "$t"; else ok "no suspicious cron lines"; fi
-
+ 
   echo "-- Account / SSH key changes since $SINCE"
   t=$(find /etc/passwd /etc/shadow /etc/sudoers /etc/sudoers.d /root/.ssh /home/*/.ssh -newermt "$SINCE" 2>/dev/null)
   if [ -n "$t" ]; then warn "Changed:"; echo "$t"; else ok "none"; fi
-
+ 
   echo
   if [ $findings = 1 ]; then
     bad "${c_bld}Possible compromise indicators found. Preserve logs before changing anything if you intend to investigate.${c_off}"
@@ -117,14 +117,14 @@ scan() {
     ok "No strong indicators. (This is a quick triage, not a forensic audit.)"
   fi
 }
-
+ 
 # ---------- 2. mitigation ----------
 mitigation_dirs() {
   local d
   for d in /opt/cpanel/ea-php*/root/etc/php.d /opt/alt/php*/etc/php.d /opt/alt/php*/link/conf \
            /usr/local/php*/lib/php.conf.d /etc/php/[0-9]*/*/conf.d /etc/php.d /etc/opt/remi/php*/php.d; do
     [ -d "$d" ] && echo "$d"; done; }
-
+ 
 mitigate() {
   hdr "Applying interim mitigation (session.upload_progress.enabled = Off)"
   local d n=0
@@ -140,7 +140,7 @@ mitigate() {
   [ -n "$t" ] && warn "These re-enable it and need editing:"$'\n'"$t" || ok "no overrides found"
   restart_php
 }
-
+ 
 # CL's fixed alt-php is now in the stable repos; the temporary TuxCare ELS repo (php-els) can be disabled.
 els_repo_cleanup() {
   [ $CL = 1 ] || return 0
@@ -149,7 +149,7 @@ els_repo_cleanup() {
     if have dnf; then dnf config-manager --set-disabled php-els; else yum-config-manager --disable php-els >/dev/null; fi
   fi
 }
-
+ 
 # ---------- 3. patch ----------
 patch() {
   hdr "Patching PHP ($PLATFORM${CL:+, CloudLinux=$CL})"
@@ -186,7 +186,7 @@ patch() {
   esac
   restart_php
 }
-
+ 
 restart_php() {
   echo "Restarting PHP services..."
   case $PLATFORM in
@@ -205,7 +205,7 @@ restart_php() {
   [ $LSWS = 1 ] && /usr/local/lsws/bin/lswsctrl restart >/dev/null 2>&1
   ok "done"
 }
-
+ 
 # ---------- 3b. cPGuard WAF check ----------
 cpguard_check() {
   local root="" d f newest hits
@@ -232,7 +232,7 @@ cpguard_check() {
   [ -x "$root/cpg-php-fpm/sbin/php-fpm" ] && \
     warn "cPGuard's bundled PHP-FPM ($("$root/cpg-php-fpm/sbin/php-fpm" -v 2>/dev/null | head -1 | cut -d' ' -f2)) can only be fixed by an OpsShield update - see table above"
 }
-
+ 
 # Any PHP worker started before the newest PHP binary was installed is still running old code.
 stale_process_check() {
   local newest=0 t p stale="" pid exe
@@ -251,7 +251,7 @@ stale_process_check() {
     ok "all PHP/web worker processes started after the newest PHP package install"
   fi
 }
-
+ 
 # ---------- 4. verify ----------
 verify() {
   hdr "PHP status on $(hostname)"
@@ -307,7 +307,7 @@ verify() {
   kernel_check
   return $bad
 }
-
+ 
 # Informational: the separate CL kernel advisory (KEV-listed CVE-2025-39964 / CVE-2026-53266 / CVE-2025-39682).
 kernel_check() {
   have kcarectl || return 0
@@ -331,13 +331,13 @@ kernel_check() {
   done
   echo "   CloudLinux $clv, running kernel $k, kcarectl effective: $(kcarectl --uname 2>/dev/null | head -1)"
 }
-
+ 
 # ---------- main ----------
 hdr "php2shell response - $(hostname)"
 echo "Platform: $PLATFORM | CloudLinux: $CL | LiteSpeed: $LSWS | Package manager: $PKG"
 echo "PHP binaries: $(php_binaries | wc -l)"
 if [ $CHECK_ONLY = 1 ]; then verify; RC=$?; cpguard_check; [ $DO_SCAN = 1 ] && scan; exit $RC; fi
-
+ 
 verify; RC=$?
 cpguard_check
 echo
@@ -353,3 +353,4 @@ if [ $DO_SCAN = 1 ]; then scan
 elif [ $AUTO_YES = 0 ]; then ask "Run the compromise scan now (read-only, can take a few minutes)?" && scan
 fi
 exit $RC
+ 

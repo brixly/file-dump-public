@@ -156,7 +156,10 @@ patch() {
   local pkgs
   case $PLATFORM in
     cpanel)
-      /scripts/upcp
+      # cPanel 138.0.18 carries the fix for cPanel's own internal PHP (CPANEL-57977); skip upcp if already there
+      local cpv; cpv=$(/usr/local/cpanel/cpanel -V 2>/dev/null | sed -E 's/ \(build ([0-9]+)\)/.\1/')
+      if ver_ge "${cpv:-0}" 138.0.18; then echo "cPanel $cpv already >= 138.0.18, skipping upcp"
+      else echo "cPanel ${cpv:-unknown} < 138.0.18, running upcp"; /scripts/upcp; fi
       els_repo_cleanup
       $PKG clean all -q
       # ea-php, alt-php, and the OS's own php packages (CL is rolling native php fixes separately)

@@ -259,8 +259,9 @@ verify() {
   printf '%-30s %-9s %-10s %s\n' "PATCH STATUS" "MITIG." "VERSION" "BINARY"
   while read -r bin; do
     [ -n "$bin" ] || continue; found=1
-    ver=$("$bin" -n -r 'echo PHP_VERSION;' 2>/dev/null)
-    [ -z "$ver" ] && ver=$("$bin" -v 2>/dev/null | sed -nE 's/^PHP ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)   # php-fpm has no -r
+    ver=$("$bin" -n -r 'echo PHP_VERSION;' 2>/dev/null | head -1)
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || ver=$("$bin" -n -v 2>/dev/null | sed -nE 's/^PHP ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)   # php-fpm has no -r
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || ver=""
     if [ -z "$ver" ]; then
       pkg=$(rpm -qf --qf '%{NAME}' "$bin" 2>/dev/null)
       if [ "$bin" = /usr/bin/php ] && [ $CL = 1 ] && [[ "$pkg" != php && "$pkg" != php-cli ]]; then

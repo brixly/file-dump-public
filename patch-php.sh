@@ -140,6 +140,15 @@ mitigate() {
   restart_php
 }
 
+# CL's fixed alt-php is now in the stable repos; the temporary TuxCare ELS repo (php-els) can be disabled.
+els_repo_cleanup() {
+  [ $CL = 1 ] || return 0
+  if $PKG repolist --enabled 2>/dev/null | grep -q '^php-els'; then
+    warn "Temporary ELS ALT PHP repo (php-els) is enabled - fixed alt-php is now in CL stable, disabling it as CL advises"
+    if have dnf; then dnf config-manager --set-disabled php-els; else yum-config-manager --disable php-els >/dev/null; fi
+  fi
+}
+
 # ---------- 3. patch ----------
 patch() {
   hdr "Patching PHP ($PLATFORM${CL:+, CloudLinux=$CL})"
@@ -147,21 +156,24 @@ patch() {
   case $PLATFORM in
     cpanel)
       /scripts/upcp
-      $PKG clean metadata -q
-      pkgs=$(rpm -qa --qf '%{NAME}\n' 'ea-php*' 'alt-php*' | sort -u)
-      [ -n "$pkgs" ] && $PKG -y update $pkgs || warn "no ea-php/alt-php packages installed"
+      els_repo_cleanup
+      $PKG clean all -q
+      # ea-php, alt-php, and the OS's own php packages (CL is rolling native php fixes separately)
+      pkgs=$(rpm -qa --qf '%{NAME}\n' 'ea-php*' 'alt-php*' 'php' 'php-*' | sort -u)
+      [ -n "$pkgs" ] && $PKG -y update $pkgs || warn "no PHP packages installed"
       [ $CL = 1 ] && have cagefsctl && cagefsctl --force-update ;;
     directadmin)
       ( cd /usr/local/directadmin/custombuild && ./build update && ./build php )
       if [ $CL = 1 ]; then
-        $PKG clean metadata -q
-        pkgs=$(rpm -qa --qf '%{NAME}\n' 'alt-php*' | sort -u)
+        els_repo_cleanup
+        $PKG clean all -q
+        pkgs=$(rpm -qa --qf '%{NAME}\n' 'alt-php*' 'php' 'php-*' | sort -u)
         [ -n "$pkgs" ] && $PKG -y update $pkgs
         have cagefsctl && cagefsctl --force-update
       fi ;;
     debian)
       apt-get update -q || warn "apt-get update reported errors - new packages may be missed"
-      pkgs=$(dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n' 'php[0-9]*' 'libapache2-mod-php*' 2>/dev/null | awk '$2=="installed"{print $1}')
+      pkgs=$(dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n' 'php[0-9]*' 'libapache2-mod-php*' 'alt-php*' 2>/dev/null | awk '$2=="installed"{print $1}')
       [ -n "$pkgs" ] && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade -o Dpkg::Options::=--force-confold $pkgs \
         || warn "no PHP packages installed via apt" ;;
     rhel)
@@ -216,6 +228,25 @@ cpguard_check() {
   [ -n "$f" ] && echo "    last cPGuard log activity: $(stat -c %y "$f" | cut -c1-16)  ($f)"
 }
 
+# Any PHP worker started before the newest PHP binary was installed is still running old code.
+stale_process_check() {
+  local newest=0 t p stale="" pid exe
+  for p in $(php_binaries); do t=$(stat -c %Y "$p" 2>/dev/null); [ "${t:-0}" -gt $newest ] && newest=$t; done
+  [ $newest = 0 ] && return
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    t=$(stat -c %Y "/proc/$pid" 2>/dev/null) || continue
+    [ "$t" -lt $newest ] && stale="$stale $pid"
+  done < <(pgrep -x 'php-fpm|php-fpm[0-9.]*|lsphp|lsphp[0-9]*|php-cgi|httpd|apache2|lshttpd|litespeed|openlitespeed' 2>/dev/null)
+  if [ -n "$stale" ]; then
+    bad "PHP/web processes started BEFORE the newest PHP package was installed (still running old code):"
+    ps -o pid,lstart,user,comm --no-headers -p ${stale// /,} | head -15
+    bad=1
+  else
+    ok "all PHP/web worker processes started after the newest PHP package install"
+  fi
+}
+
 # ---------- 4. verify ----------
 verify() {
   hdr "PHP status on $(hostname)"
@@ -224,26 +255,52 @@ verify() {
   while read -r bin; do
     [ -n "$bin" ] || continue; found=1
     if ! ver=$("$bin" -n -r 'echo PHP_VERSION;' 2>/dev/null) || [ -z "$ver" ]; then
-      printf '%-30s %-9s %-10s %s\n' "UNKNOWN (will not run)" "-" "-" "$bin"; bad=1; continue; fi
+      pkg=$(rpm -qf --qf '%{NAME}' "$bin" 2>/dev/null)
+      if [ "$bin" = /usr/bin/php ] && [ $CL = 1 ] && [[ -z "$pkg" || "$pkg" == alt-php* ]]; then
+        printf '%-30s %-9s %-10s %s\n' "SKIPPED (CL selector wrapper)" "-" "-" "$bin"
+      else
+        printf '%-30s %-9s %-10s %s\n' "UNKNOWN (will not run)" "-" "-" "$bin"; bad=1
+      fi; continue; fi
     br=${ver%.*}
     log=""
-    if pkg=$(rpm -qf "$bin" 2>/dev/null); then log=$(rpm -q --changelog "$pkg" 2>/dev/null | head -300)
+    if pkg=$(rpm -qf --qf '%{NAME}' "$bin" 2>/dev/null); then
+      # CL puts the CVE note in the package that owns the binary and/or its -common package; check both
+      log=$(rpm -q --changelog "$pkg" 2>/dev/null | head -300)
+      case $pkg in
+        alt-php[0-9]*) log+=$'\n'$(rpm -q --changelog "${pkg%%-php-*}-common" "${pkg}-common" 2>/dev/null | head -300) ;;
+        ea-php[0-9]*)  log+=$'\n'$(rpm -q --changelog "${pkg%%-php-*}-php-common" 2>/dev/null | head -300) ;;
+      esac
     else pkg=$(dpkg -S "$bin" 2>/dev/null | head -1 | cut -d: -f1)
          [ -n "$pkg" ] && log=$(zcat "/usr/share/doc/$pkg/changelog.Debian.gz" 2>/dev/null | head -300); fi
     if   [ -n "${FIXED[$br]}" ] && ver_ge "$ver" "${FIXED[$br]}"; then st="PATCHED"
     elif grep -qE "$CVE_RE" <<<"$log";                             then st="PATCHED (backport)"
-    elif ! ver_ge "$br" 7.4;                                        then st="NO FIX - EOL"; bad=1
+    elif ! ver_ge "$br" 7.4;                                        then st="NOT PATCHED (EOL upstream)"; bad=1
     elif [ -z "$log" ] && [ -z "${FIXED[$br]}" ];                   then st="CHECK MANUALLY"; bad=1
     else st="NOT PATCHED"; bad=1; fi
     mit=$("$bin" -r 'echo ini_get("session.upload_progress.enabled") ? "on" : "off";' 2>/dev/null)
     printf '%-30s %-9s %-10s %s\n' "$st" "${mit:-?}" "$ver" "$bin"
   done < <(php_binaries)
   [ $found = 1 ] || { warn "No PHP binaries found"; bad=1; }
+  stale_process_check
   echo
   if [ $bad = 0 ]; then ok "${c_bld}RESULT: all PHP binaries patched${c_off}"
   else bad "${c_bld}RESULT: action still needed - unpatched binaries need the mitigation ('off' column) until a fix lands${c_off}"; fi
   [ "$PLATFORM" = cpanel ] && echo "Note: a user's own .user.ini/php.ini can override the mitigation; the 'MITIG.' column shows the server default."
+  kernel_check
   return $bad
+}
+
+# Informational: the separate CL kernel advisory (KEV-listed CVE-2025-39964 / CVE-2026-53266 / CVE-2025-39682).
+kernel_check() {
+  have kcarectl || return 0
+  echo
+  echo "-- Kernel (CloudLinux advisory q1t6qbd5jjy5, separate from php2shell) --"
+  local info; info=$(kcarectl --patch-info 2>/dev/null)
+  local c
+  for c in CVE-2025-39964 CVE-2026-53266 CVE-2025-39682; do
+    if grep -q "$c" <<<"$info"; then ok "$c livepatched"; else warn "$c not in kcarectl --patch-info (may need kcarectl --update, a kernel update + reboot, or not apply to this kernel)"; fi
+  done
+  echo "   running kernel: $(uname -r)   kcarectl effective: $(kcarectl --uname 2>/dev/null | head -1)"
 }
 
 # ---------- main ----------

@@ -61,7 +61,8 @@ WEBROOTS=(/home/*/public_html /home/*/domains/*/public_html /var/www /usr/share/
 
 php_binaries() {
   local b; for b in /opt/cpanel/ea-php*/root/usr/bin/php /opt/alt/php*/usr/bin/php \
-                    /usr/local/php*/bin/php /usr/bin/php[0-9]*.[0-9]* /opt/remi/php*/root/usr/bin/php /usr/bin/php; do
+                    /usr/local/php*/bin/php /usr/bin/php[0-9]*.[0-9]* /opt/remi/php*/root/usr/bin/php /usr/bin/php \
+                    /opt/cpguard/cpg-php-fpm/bin/php /opt/cpguard/cpg-php-fpm/sbin/php-fpm /usr/local/lsws/lsphp*/bin/php; do
     [ -x "$b" ] && echo "$(readlink -f "$b")"; done | sort -u; }
 
 # ---------- 1. compromise scan ----------
@@ -213,9 +214,10 @@ cpguard_check() {
   [ -n "$root" ] || return 0            # cPGuard not installed - nothing to check
   hdr "cPGuard WAF"
   # rule files cPGuard may have dropped, in its own tree or the server's ModSecurity include dirs
+  # cPGuard installs its ModSecurity rules under /etc/cpguard/ (included from modsec2.user.conf on cPanel)
   hits=$(grep -rslE 'PHP_SESSION_UPLOAD_PROGRESS|upload_progress|php2shell|CVE-2026-10961' \
-          "$root" /etc/apache2/conf.d /etc/httpd/conf.d /usr/local/apache/conf /etc/modsecurity /usr/local/lsws/conf \
-          /etc/nginx/modsec /usr/local/directadmin/custombuild/custom/modsecurity 2>/dev/null | grep -iE '\.conf$|rules|\.rule' | head -5)
+          /etc/cpguard "$root" /etc/apache2/conf.d /etc/httpd/conf.d /usr/local/apache/conf /etc/modsecurity /usr/local/lsws/conf \
+          /etc/nginx/modsec /usr/local/directadmin/custombuild/custom/modsecurity 2>/dev/null | grep -vE '/cpg-php-fpm/|\.log$|\.h$' | head -5)
   if [ -n "$hits" ]; then
     ok "php2shell WAF rule present:"; echo "$hits" | sed 's/^/    /'
     newest=$(stat -c '%y %n' $hits 2>/dev/null | sort | tail -1 | cut -c1-16)
@@ -226,6 +228,9 @@ cpguard_check() {
   fi
   f=$(ls -t "$root"/*.log "$root"/logs/*.log /var/log/cpguard*.log 2>/dev/null | head -1)
   [ -n "$f" ] && echo "    last cPGuard log activity: $(stat -c %y "$f" | cut -c1-16)  ($f)"
+  # cPGuard ships its own PHP-FPM for its UI; it is reported in the PHP status table above
+  [ -x "$root/cpg-php-fpm/sbin/php-fpm" ] && \
+    warn "cPGuard's bundled PHP-FPM ($("$root/cpg-php-fpm/sbin/php-fpm" -v 2>/dev/null | head -1 | cut -d' ' -f2)) can only be fixed by an OpsShield update - see table above"
 }
 
 # Any PHP worker started before the newest PHP binary was installed is still running old code.
@@ -254,9 +259,11 @@ verify() {
   printf '%-30s %-9s %-10s %s\n' "PATCH STATUS" "MITIG." "VERSION" "BINARY"
   while read -r bin; do
     [ -n "$bin" ] || continue; found=1
-    if ! ver=$("$bin" -n -r 'echo PHP_VERSION;' 2>/dev/null) || [ -z "$ver" ]; then
+    ver=$("$bin" -n -r 'echo PHP_VERSION;' 2>/dev/null)
+    [ -z "$ver" ] && ver=$("$bin" -v 2>/dev/null | sed -nE 's/^PHP ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)   # php-fpm has no -r
+    if [ -z "$ver" ]; then
       pkg=$(rpm -qf --qf '%{NAME}' "$bin" 2>/dev/null)
-      if [ "$bin" = /usr/bin/php ] && [ $CL = 1 ] && [[ -z "$pkg" || "$pkg" == alt-php* ]]; then
+      if [ "$bin" = /usr/bin/php ] && [ $CL = 1 ] && [[ "$pkg" != php && "$pkg" != php-cli ]]; then
         printf '%-30s %-9s %-10s %s\n' "SKIPPED (CL selector wrapper)" "-" "-" "$bin"
       else
         printf '%-30s %-9s %-10s %s\n' "UNKNOWN (will not run)" "-" "-" "$bin"; bad=1
@@ -274,10 +281,13 @@ verify() {
          [ -n "$pkg" ] && log=$(zcat "/usr/share/doc/$pkg/changelog.Debian.gz" 2>/dev/null | head -300); fi
     if   [ -n "${FIXED[$br]}" ] && ver_ge "$ver" "${FIXED[$br]}"; then st="PATCHED"
     elif grep -qE "$CVE_RE" <<<"$log";                             then st="PATCHED (backport)"
+    elif [[ "$bin" == /opt/alt/php-internal/* ]];                   then st="INFO: CL internal, not web"
+    elif [[ "$bin" == /opt/cpguard/* ]];                            then st="NOT PATCHED (cPGuard bundled)"; bad=1
     elif ! ver_ge "$br" 7.4;                                        then st="NOT PATCHED (EOL upstream)"; bad=1
     elif [ -z "$log" ] && [ -z "${FIXED[$br]}" ];                   then st="CHECK MANUALLY"; bad=1
     else st="NOT PATCHED"; bad=1; fi
     mit=$("$bin" -r 'echo ini_get("session.upload_progress.enabled") ? "on" : "off";' 2>/dev/null)
+    [[ "$bin" == */php-fpm ]] && mit="n/a"
     printf '%-30s %-9s %-10s %s\n' "$st" "${mit:-?}" "$ver" "$bin"
   done < <(php_binaries)
   [ $found = 1 ] || { warn "No PHP binaries found"; bad=1; }
@@ -295,12 +305,23 @@ kernel_check() {
   have kcarectl || return 0
   echo
   echo "-- Kernel (CloudLinux advisory q1t6qbd5jjy5, separate from php2shell) --"
-  local info; info=$(kcarectl --patch-info 2>/dev/null)
-  local c
+  local info k clv c inkernel
+  info=$(kcarectl --patch-info 2>/dev/null); k=$(uname -r)
+  clv=$(grep -oE '[0-9]+' /etc/cloudlinux-release 2>/dev/null | head -1)
+  # Fixes already compiled into the running kernel, per CL advisory q1t6qbd5jjy5 (22 Oct 2026)
+  inkernel=""
+  case $clv in
+    7|8)  ver_ge "${k%%.lve*}" 4.18.0-553.142.1 && inkernel="CVE-2026-53266" ;;
+    9)    ver_ge "${k%%.el9*}" 5.14.0-687.23.1  && inkernel="CVE-2026-53266 CVE-2025-39682" ;;
+    10)   ver_ge "${k%%.el10*}" 6.12.0-211.59.1 && inkernel="CVE-2025-39964 CVE-2026-53266 CVE-2025-39682" ;;
+  esac
   for c in CVE-2025-39964 CVE-2026-53266 CVE-2025-39682; do
-    if grep -q "$c" <<<"$info"; then ok "$c livepatched"; else warn "$c not in kcarectl --patch-info (may need kcarectl --update, a kernel update + reboot, or not apply to this kernel)"; fi
+    if   grep -q "$c" <<<"$info";     then ok "$c livepatched (KernelCare)"
+    elif grep -q "$c" <<<"$inkernel"; then ok "$c fixed in running kernel"
+    elif [ "$c" = CVE-2025-39682 ] && [[ "$clv" == 7 || "$clv" == 8 ]] && ! grep -q lts <<<"$k"; then ok "$c does not affect CloudLinux $clv"
+    else warn "$c not covered: try 'kcarectl --update'; otherwise needs kernel update + reboot (see CL advisory)"; fi
   done
-  echo "   running kernel: $(uname -r)   kcarectl effective: $(kcarectl --uname 2>/dev/null | head -1)"
+  echo "   CloudLinux $clv, running kernel $k, kcarectl effective: $(kcarectl --uname 2>/dev/null | head -1)"
 }
 
 # ---------- main ----------
